@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useRef, useEffect } from 'react';
+import { marked } from 'marked';
 
 interface ApiInfo {
   supported_companies: string[];
@@ -23,27 +24,31 @@ export default function SECAnalyzer() {
   const eventSourceRef = useRef<EventSource | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  // Mock marked functionality since it's not available
-  const getRenderedMarkdown = (markdown: string): string => {
-    if (!markdown) return '';
-    // Simple markdown parsing for basic formatting
-    return markdown
-      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*(.*?)\*/g, '<em>$1</em>')
-      .replace(/\n/g, '<br>')
-      .replace(/#{3}\s*(.*)/g, '<h3 class="text-lg font-semibold mt-4 mb-2">$1</h3>')
-      .replace(/#{2}\s*(.*)/g, '<h2 class="text-xl font-semibold mt-4 mb-2">$1</h2>')
-      .replace(/#{1}\s*(.*)/g, '<h1 class="text-2xl font-bold mt-4 mb-2">$1</h1>');
-  };
-
   useEffect(() => {
-    // Mock API info
-    setInfo({
-      supported_companies: ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA', 'JPM', 'JNJ', 'V', 'WMT', 'PG', 'HD', 'UNH', 'DIS', 'MA', 'CRM', 'NFLX', 'ADBE', 'PYPL'],
-      filing_types: ['10-K', '10-Q', '8-K', 'DEF 14A'],
-      time_period: '2020-2024'
+    marked.setOptions({
+      breaks: true,
+      gfm: true,
     });
   }, []);
+
+  useEffect(() => {
+    fetchInfo();
+  }, []);
+
+  const fetchInfo = async (): Promise<void> => {
+    try {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/info`);
+      const data: ApiInfo = await res.json();
+      setInfo(data);
+    } catch (error) {
+      console.error('Failed to fetch API info:', error);
+    }
+  };
+
+  const getRenderedMarkdown = (markdown: string): string => {
+    if (!markdown) return '';
+    return marked.parse(markdown) as string;
+  };
 
   const handleSubmit = async (e: any): Promise<void> => {
     e.preventDefault();
@@ -52,32 +57,79 @@ export default function SECAnalyzer() {
     setLoading(true);
     setResponse('');
 
-    // Mock streaming response
-    const mockResponse = `## Analysis of ${query}
+    if (eventSourceRef.current) eventSourceRef.current.close();
+    if (abortControllerRef.current) abortControllerRef.current.abort();
 
-      Based on the SEC filings analysis:
+    abortControllerRef.current = new AbortController();
 
-      **Key Findings:**
-      - Revenue growth has been **strong** over the recent quarters
-      - Operating margins have *improved* significantly
-      - Cash flow remains robust
+    try {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/query`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+        },
+        body: JSON.stringify({ query }),
+        signal: abortControllerRef.current.signal,
+      });
 
-      **Financial Highlights:**
-      - Q3 2024 revenue: $45.2B (+12% YoY)
-      - Net income: $8.7B (+15% YoY)
-      - Operating cash flow: $12.1B
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      if (!response.body) throw new Error('ReadableStream not supported');
 
-      This analysis is based on the latest SEC 10-Q and 10-K filings.`;
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
 
-    // Simulate streaming
-    const words = mockResponse.split(' ');
-    for (let i = 0; i < words.length; i++) {
-      if (!loading) break;
-      await new Promise(resolve => setTimeout(resolve, 50));
-      setResponse(words.slice(0, i + 1).join(' '));
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const chunk = decoder.decode(value, { stream: true });
+          buffer += chunk;
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const dataStr = line.slice(6).trim();
+                if (dataStr === '[DONE]') {
+                  setLoading(false);
+                  return;
+                }
+
+                const data: StreamData = JSON.parse(dataStr);
+                if (data.done) {
+                  setLoading(false);
+                  return;
+                }
+                if (data.error) {
+                  setResponse(prev => prev + `\n\nError: ${data.error}`);
+                  setLoading(false);
+                  return;
+                }
+                if (data.content) {
+                  setResponse(prev => prev + data.content);
+                }
+              } catch (parseError) {
+                console.error('Error parsing SSE data:', parseError, 'Raw line:', line);
+              }
+            }
+          }
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    } catch (error: any) {
+      console.error('Streaming error:', error);
+      if (error.name !== 'AbortError') {
+        setResponse('Sorry, there was an error processing your request. Please try again.');
+      }
+    } finally {
+      setLoading(false);
     }
-    
-    setLoading(false);
   };
 
   const exampleQueries: string[] = [
@@ -107,7 +159,7 @@ export default function SECAnalyzer() {
 
         {/* Chat Interface */}
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 mb-8 overflow-hidden">
-          <div className="p-5 bg-gray-50 border-b border-gray-200">
+          <div className="p-5 bg-gray-50">
             <h2 className="text-lg font-semibold text-gray-800">💬 Ask a Question</h2>
           </div>
           
@@ -117,7 +169,7 @@ export default function SECAnalyzer() {
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="E.g., 'What was Apple's revenue in Q1 2024?'"
-                className="flex-1 p-4 text-gray-900 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none placeholder-gray-500 transition-all duration-200"
+                className="flex-1 p-4 text-gray-900 border border-gray-300 rounded-lg focus:border-blue-500 focus:outline-none resize-none placeholder-gray-500"
                 rows={2}
                 disabled={loading}
                 onKeyDown={(e) => {
@@ -130,7 +182,7 @@ export default function SECAnalyzer() {
               <button
                 onClick={handleSubmit}
                 disabled={loading || !query.trim()}
-                className="px-6 py-3 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
+                className="px-6 py-3 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors duration-200"
               >
                 {loading ? (
                   <svg className="animate-spin h-5 w-5 mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -146,7 +198,7 @@ export default function SECAnalyzer() {
 
           {/* Response */}
           {(response || loading) && (
-            <div className="border-t border-gray-200 bg-gray-50 text-gray-900 p-6">
+            <div className="bg-gray-50 text-gray-900 p-6">
               {loading && !response && (
                 <div className="flex items-center space-x-2 text-gray-600">
                   <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -159,7 +211,7 @@ export default function SECAnalyzer() {
               {response && (
                 <div className="bg-white p-6 rounded-lg border border-gray-200 min-h-[400px]">
                   <div
-                    className="prose prose-blue max-w-none text-gray-800 leading-relaxed"
+                    className="prose prose-blue max-w-none"
                     dangerouslySetInnerHTML={{
                       __html: getRenderedMarkdown(response) + (loading ? '<span class="animate-pulse text-blue-500 ml-1">▌</span>' : '')
                     }}
@@ -172,7 +224,7 @@ export default function SECAnalyzer() {
 
         {/* Example Queries */}
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 mb-8 overflow-hidden">
-          <div className="p-5 border-b border-gray-200 bg-gray-50">
+          <div className="p-5 bg-gray-50">
             <h2 className="text-lg font-semibold text-gray-800">💡 Example Questions</h2>
           </div>
           <div className="p-5 grid gap-2">
@@ -180,7 +232,7 @@ export default function SECAnalyzer() {
               <button
                 key={index}
                 onClick={() => handleExampleClick(example)}
-                className="text-left p-3 bg-blue-50 hover:bg-blue-100 border border-blue-200 hover:border-blue-300 rounded-lg transition-colors duration-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1"
+                className="text-left p-3 bg-blue-50 hover:bg-blue-100 border border-blue-200 hover:border-blue-300 rounded-lg transition-colors duration-200 text-sm"
                 disabled={loading}
               >
                 <span className="text-blue-700">{example}</span>
@@ -193,7 +245,7 @@ export default function SECAnalyzer() {
         {info && (
           <div className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
             <div
-              className="p-5 border-b border-gray-200 bg-gray-50 flex justify-between items-center cursor-pointer hover:bg-gray-100 transition-colors duration-200"
+              className="p-5 bg-gray-50 flex justify-between items-center cursor-pointer"
               onClick={() => setShowCompanies(!showCompanies)}
             >
               <h2 className="text-lg font-semibold text-gray-800">📊 Supported Companies</h2>
@@ -205,13 +257,13 @@ export default function SECAnalyzer() {
                   {info.supported_companies.map((company) => (
                     <div 
                       key={company}
-                      className="bg-blue-50 text-blue-700 px-2 py-1 rounded text-center font-medium text-sm border border-blue-100"
+                      className="bg-blue-50 text-blue-700 px-2 py-1 rounded text-center font-medium text-sm"
                     >
                       {company}
                     </div>
                   ))}
                 </div>
-                <div className="mt-4 text-xs text-gray-600 pt-4 border-t border-gray-100">
+                <div className="mt-4 text-xs text-gray-600">
                   <span className="font-semibold">Filing Types:</span> {info.filing_types.join(', ')} | 
                   <span className="font-semibold"> Time Period:</span> {info.time_period}
                 </div>
